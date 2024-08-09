@@ -90,7 +90,27 @@ class TokenizerManager:
         else:
             self.context_len = get_context_length(self.hf_config)
 
-        if is_multimodal_model(self.model_path):
+        if "LLaVA-NeXT-Video-32B-Qwen" in self.model_path:
+            self.processor = get_processor(
+                server_args.processor_path,
+                tokenizer_mode=server_args.tokenizer_mode,
+                trust_remote_code=server_args.trust_remote_code,
+            )
+            
+            self.tokenizer = get_tokenizer(
+                server_args.tokenizer_path,
+                tokenizer_mode=server_args.tokenizer_mode,
+                trust_remote_code=server_args.trust_remote_code,
+            )
+            
+            os.environ["TOKENIZERS_PARALLELISM"] = "false"
+            
+            self.executor = concurrent.futures.ProcessPoolExecutor(
+                initializer=init_global_processor,
+                mp_context=mp.get_context("fork"),
+                initargs=(server_args,),
+            )
+        elif is_multimodal_model(self.model_path):
             self.processor = get_processor(
                 server_args.tokenizer_path,
                 tokenizer_mode=server_args.tokenizer_mode,
@@ -197,7 +217,7 @@ class TokenizerManager:
             return_logprob = obj.return_logprob[0]
             logprob_start_len = obj.logprob_start_len[0]
             top_logprobs_num = obj.top_logprobs_num[0]
-
+        
         tokenized_obj = TokenizedGenerateReqInput(
             rid,
             input_text,
@@ -517,7 +537,7 @@ def init_global_processor(server_args: ServerArgs):
     global global_processor
     transformers.logging.set_verbosity_error()
     global_processor = get_processor(
-        server_args.tokenizer_path,
+        server_args.processor_path if server_args.processor_path else server_args.tokenizer_path,
         tokenizer_mode=server_args.tokenizer_mode,
         trust_remote_code=server_args.trust_remote_code,
     )

@@ -322,6 +322,8 @@ def match_chat_ml(model_path: str):
     if "tinyllama" in model_path:
         return get_chat_template("chatml")
     # Now the suffix for qwen2 chat model is "instruct"
+    if "qwen" in model_path and "llava-next" in model_path:
+        return get_chat_template("qwen")
     if "qwen" in model_path and ("chat" in model_path or "instruct" in model_path):
         return get_chat_template("qwen")
     if (

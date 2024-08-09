@@ -105,6 +105,25 @@ def get_context_length(config):
 # A fast LLaMA tokenizer with the pre-processed `tokenizer.json` file.
 _FAST_LLAMA_TOKENIZER = "hf-internal-testing/llama-tokenizer"
 
+def custom_encode(self, prompt, **kwargs):
+    # 进行分割
+    parts = prompt.split('<image>')
+    encoded_parts = []
+
+    for part in parts:
+        # 对分割后的每个部分进行编码
+        if part:
+            encoded = self._base_encode(part, **kwargs)
+            encoded_parts.extend(encoded)
+        # 插入特殊标记
+        encoded_parts.append(-200)
+
+    # 去掉最后一个多余的特殊标记
+    if encoded_parts[-1] == -200:
+        encoded_parts.pop()
+
+    return encoded_parts
+
 
 def get_tokenizer(
     tokenizer_name: str,
@@ -187,6 +206,8 @@ def get_tokenizer(
             "Using a slow tokenizer. This might cause a significant "
             "slowdown. Consider using a fast tokenizer instead."
         )
+    tokenizer._base_encode = tokenizer.encode
+    tokenizer.encode = lambda prompt, **kwargs: custom_encode(tokenizer, prompt, **kwargs)
     return tokenizer
 
 

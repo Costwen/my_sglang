@@ -147,7 +147,6 @@ class ModelRunner:
             seed=42,
             skip_tokenizer_init=True,
         )
-
         if is_llama3_405b_fp8(self.model_config) and self.tp_size <= 8:
             # A temporary hack to fix the num_heads for meta-llama/Meta-Llama-3.1-405B-FP8 checkpoints
             self.model_config.hf_config.num_key_value_heads = 8

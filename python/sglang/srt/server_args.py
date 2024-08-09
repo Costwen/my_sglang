@@ -26,6 +26,7 @@ class ServerArgs:
     # Model and tokenizer
     model_path: str
     tokenizer_path: Optional[str] = None
+    processor_path: str = ""
     tokenizer_mode: str = "auto"
     load_format: str = "auto"
     dtype: str = "auto"

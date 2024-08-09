@@ -212,6 +212,11 @@ def is_multimodal_model(model):
 
     if isinstance(model, str):
         model = model.lower()
+        if "llava-next" in model and "qwen" in model:
+            return False
+
+    if isinstance(model, str):
+        model = model.lower()
         return "llava" in model or "yi-vl" in model or "llava-next" in model
 
     if isinstance(model, ModelConfig):
