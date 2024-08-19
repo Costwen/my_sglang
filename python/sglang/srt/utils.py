@@ -228,6 +228,15 @@ def is_multimodal_model(model):
     raise ValueError("unrecognized type")
 
 
+def is_generation_model(model_architectures):
+    if (
+        "LlamaEmbeddingModel" in model_architectures
+        or "MistralModel" in model_architectures
+    ):
+        return False
+    return True
+
+
 def decode_video_base64(video_base64):
     from PIL import Image
 
@@ -369,6 +378,26 @@ def kill_parent_process():
         if child.pid != current_process.pid:
             os.kill(child.pid, 9)
     os.kill(parent_process.pid, 9)
+
+
+def kill_child_process(pid, including_parent=True):
+    try:
+        parent = psutil.Process(pid)
+    except psutil.NoSuchProcess:
+        return
+
+    children = parent.children(recursive=True)
+    for child in children:
+        try:
+            child.kill()
+        except psutil.NoSuchProcess:
+            pass
+
+    if including_parent:
+        try:
+            parent.kill()
+        except psutil.NoSuchProcess:
+            pass
 
 
 def monkey_patch_vllm_p2p_access_check(gpu_id: int):
@@ -524,26 +553,6 @@ class CustomCacheManager(FileCacheManager):
                 raise RuntimeError("Could not create or locate cache dir")
 
 
-API_KEY_HEADER_NAME = "X-API-Key"
-
-
-class APIKeyValidatorMiddleware(BaseHTTPMiddleware):
-    def __init__(self, app, api_key: str):
-        super().__init__(app)
-        self.api_key = api_key
-
-    async def dispatch(self, request, call_next):
-        # extract API key from the request headers
-        api_key_header = request.headers.get(API_KEY_HEADER_NAME)
-        if not api_key_header or api_key_header != self.api_key:
-            return JSONResponse(
-                status_code=403,
-                content={"detail": "Invalid API Key"},
-            )
-        response = await call_next(request)
-        return response
-
-
 def get_ip_address(ifname):
     """
     Get the IP address of a network interface.
@@ -685,3 +694,15 @@ def monkey_patch_vllm_qvk_linear_loader():
         origin_weight_loader(self, param, loaded_weight, loaded_shard_id)
 
     setattr(QKVParallelLinear, "weight_loader", weight_loader_srt)
+
+
+def add_api_key_middleware(app, api_key):
+    @app.middleware("http")
+    async def authentication(request, call_next):
+        if request.method == "OPTIONS":
+            return await call_next(request)
+        if request.url.path.startswith("/health"):
+            return await call_next(request)
+        if request.headers.get("Authorization") != "Bearer " + api_key:
+            return JSONResponse(content={"error": "Unauthorized"}, status_code=401)
+        return await call_next(request)

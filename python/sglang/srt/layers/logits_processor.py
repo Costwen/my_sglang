@@ -25,7 +25,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
 )
 
-from sglang.srt.model_executor.model_runner import ForwardMode, InputMetadata
+from sglang.srt.model_executor.forward_batch_info import ForwardMode, InputMetadata
 
 
 @dataclasses.dataclass
@@ -209,7 +209,7 @@ class LogitsProcessor(nn.Module):
                 all_logits = all_logits[:, : self.config.vocab_size].float()
 
                 all_logprobs = all_logits
-                del all_logits
+                del all_logits, hidden_states
                 all_logprobs[:] = torch.nn.functional.log_softmax(all_logprobs, dim=-1)
 
                 # Get the logprob of top-k tokens

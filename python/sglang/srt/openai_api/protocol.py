@@ -54,10 +54,32 @@ class LogProbs(BaseModel):
     top_logprobs: List[Optional[Dict[str, float]]] = Field(default_factory=list)
 
 
+class TopLogprob(BaseModel):
+    token: str
+    bytes: List[int]
+    logprob: float
+
+
+class ChatCompletionTokenLogprob(BaseModel):
+    token: str
+    bytes: List[int]
+    logprob: float
+    top_logprobs: List[TopLogprob]
+
+
+class ChoiceLogprobs(BaseModel):
+    # build for v1/chat/completions response
+    content: List[ChatCompletionTokenLogprob]
+
+
 class UsageInfo(BaseModel):
     prompt_tokens: int = 0
     total_tokens: int = 0
     completion_tokens: Optional[int] = 0
+
+
+class StreamOptions(BaseModel):
+    include_usage: Optional[bool] = False
 
 
 class FileRequest(BaseModel):
@@ -75,6 +97,12 @@ class FileResponse(BaseModel):
     created_at: int
     filename: str
     purpose: str
+
+
+class FileDeleteResponse(BaseModel):
+    id: str
+    object: str = "file"
+    deleted: bool
 
 
 class BatchRequest(BaseModel):
@@ -125,6 +153,7 @@ class CompletionRequest(BaseModel):
     seed: Optional[int] = None
     stop: Optional[Union[str, List[str]]] = Field(default_factory=list)
     stream: Optional[bool] = False
+    stream_options: Optional[StreamOptions] = None
     suffix: Optional[str] = None
     temperature: Optional[float] = 1.0
     top_p: Optional[float] = 1.0
@@ -133,6 +162,9 @@ class CompletionRequest(BaseModel):
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
     regex: Optional[str] = None
     ignore_eos: Optional[bool] = False
+    min_tokens: Optional[int] = 0
+    repetition_penalty: Optional[float] = 1.0
+    stop_token_ids: Optional[List[int]] = Field(default_factory=list)
 
 
 class CompletionResponseChoice(BaseModel):
@@ -164,7 +196,7 @@ class CompletionStreamResponse(BaseModel):
     created: int = Field(default_factory=lambda: int(time.time()))
     model: str
     choices: List[CompletionResponseStreamChoice]
-    usage: UsageInfo
+    usage: Optional[UsageInfo] = None
 
 
 class ChatCompletionMessageGenericParam(BaseModel):
@@ -223,12 +255,16 @@ class ChatCompletionRequest(BaseModel):
     seed: Optional[int] = None
     stop: Optional[Union[str, List[str]]] = Field(default_factory=list)
     stream: Optional[bool] = False
+    stream_options: Optional[StreamOptions] = None
     temperature: Optional[float] = 0.7
     top_p: Optional[float] = 1.0
     user: Optional[str] = None
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
     regex: Optional[str] = None
+    min_tokens: Optional[int] = 0
+    repetition_penalty: Optional[float] = 1.0
+    stop_token_ids: Optional[List[int]] = Field(default_factory=list)
 
 
 class ChatMessage(BaseModel):
@@ -239,8 +275,8 @@ class ChatMessage(BaseModel):
 class ChatCompletionResponseChoice(BaseModel):
     index: int
     message: ChatMessage
-    logprobs: Optional[LogProbs] = None
-    finish_reason: Optional[str] = None
+    logprobs: Optional[Union[LogProbs, ChoiceLogprobs]] = None
+    finish_reason: str
 
 
 class ChatCompletionResponse(BaseModel):
@@ -260,7 +296,7 @@ class DeltaMessage(BaseModel):
 class ChatCompletionResponseStreamChoice(BaseModel):
     index: int
     delta: DeltaMessage
-    logprobs: Optional[LogProbs] = None
+    logprobs: Optional[Union[LogProbs, ChoiceLogprobs]] = None
     finish_reason: Optional[str] = None
 
 
@@ -270,3 +306,21 @@ class ChatCompletionStreamResponse(BaseModel):
     created: int = Field(default_factory=lambda: int(time.time()))
     model: str
     choices: List[ChatCompletionResponseStreamChoice]
+    usage: Optional[UsageInfo] = None
+
+
+class EmbeddingRequest(BaseModel):
+    # Ordered by official OpenAI API documentation
+    # https://platform.openai.com/docs/api-reference/embeddings/create
+    input: Union[List[int], List[List[int]], str, List[str]]
+    model: str
+    encoding_format: str = "float"
+    dimensions: int = None
+    user: Optional[str] = None
+
+
+class EmbeddingResponse(BaseModel):
+    index: str
+    embedding: List[float] = None
+    object: str = "embedding"
+    usage: Optional[UsageInfo] = None

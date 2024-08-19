@@ -30,13 +30,12 @@ from vllm.config import CacheConfig
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
-from sglang.srt.managers.schedule_batch import ForwardMode
 from sglang.srt.mm_utils import (
     get_anyres_image_grid_shape,
     unpad_image,
     unpad_image_shape,
 )
-from sglang.srt.model_executor.model_runner import InputMetadata
+from sglang.srt.model_executor.forward_batch_info import ForwardMode, InputMetadata
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 from .siglip_encoder import SigLipVisionTower
 
@@ -99,13 +98,18 @@ class LlavaVidForCausalLM(nn.Module):
         # pixel_values = torch.load("images.pt", map_location='cpu').to(pixel_values.device)
 
         # NOTE: This is not mebuild_vision_towermory efficient. (output_hidden_states=True) will save all the hidden stated.
-        chunk_size = 4
+        chunk_size = 2
         selected_image_feature = []
         device = pixel_values.device
         num_of_frames = pixel_values.shape[0]
     
-        image_output = self.vision_tower(pixel_values)
+        for i in range(0, num_of_frames, chunk_size):
+            image_output = self.vision_tower(pixel_values[i:i + chunk_size])
+            selected_image_feature.append(image_output)
+        
+        image_output = torch.cat(selected_image_feature, dim=0)
 
+        # image_output = self.vision_tower(pixel_values)
         image_output = image_output.view(num_of_frames, self.num_patches_per_side, self.num_patches_per_side, -1)
 
         image_output = self.multi_modal_projector(image_output)
@@ -141,7 +145,6 @@ class LlavaVidForCausalLM(nn.Module):
     ) -> torch.Tensor:
         if input_metadata.forward_mode == ForwardMode.EXTEND:
             bs = input_metadata.batch_size
-
             # Embed text input
             input_embeds = self.language_model.model.embed_tokens(input_ids)
 

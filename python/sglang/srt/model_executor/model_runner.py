@@ -19,6 +19,7 @@ import importlib
 import importlib.resources
 import logging
 import pkgutil
+import warnings
 from functools import lru_cache
 from typing import Optional, Type
 
@@ -40,16 +41,18 @@ from vllm.distributed import (
 from vllm.model_executor.models import ModelRegistry
 
 from sglang.global_config import global_config
-from sglang.srt.managers.schedule_batch import (
-    Batch,
-    ForwardMode,
-    InputMetadata,
-    global_server_args_dict,
+from sglang.srt.managers.schedule_batch import ScheduleBatch, global_server_args_dict
+from sglang.srt.mem_cache.memory_pool import (
+    MHATokenToKVPool,
+    MLATokenToKVPool,
+    ReqToTokenPool,
 )
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPool
+from sglang.srt.model_config import AttentionArch
+from sglang.srt.model_executor.forward_batch_info import ForwardMode, InputMetadata
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     get_available_gpu_memory,
+    is_generation_model,
     is_llama3_405b_fp8,
     is_multimodal_model,
     monkey_patch_vllm_dummy_weight_loader,
@@ -85,6 +88,7 @@ class ModelRunner:
                 "disable_flashinfer": server_args.disable_flashinfer,
                 "disable_flashinfer_sampling": server_args.disable_flashinfer_sampling,
                 "attention_reduce_in_fp32": server_args.attention_reduce_in_fp32,
+                "enable_mla": server_args.enable_mla,
             }
         )
 
@@ -121,12 +125,18 @@ class ModelRunner:
 
         # Load the model and create memory pool
         self.load_model()
-        self.init_memory_pool(total_gpu_memory, server_args.max_num_reqs)
+        self.init_memory_pool(
+            total_gpu_memory,
+            server_args.max_num_reqs,
+            server_args.max_total_tokens,
+        )
         self.init_cublas()
-        self.init_flash_infer()
+        self.init_flashinfer()
 
-        # Capture cuda graphs
-        self.init_cuda_graphs()
+        if self.is_generation:
+            # FIXME Currently, cuda graph only capture decode steps, which only exists in causal models
+            # Capture cuda graphs
+            self.init_cuda_graphs()
 
     def load_model(self):
         logger.info(
@@ -176,6 +186,10 @@ class ModelRunner:
             scheduler_config=None,
             cache_config=None,
         )
+        self.is_generation = is_generation_model(
+            self.model_config.hf_config.architectures
+        )
+
         logger.info(
             f"[gpu={self.gpu_id}] Load weight end. "
             f"type={type(self.model).__name__}, "
@@ -187,23 +201,41 @@ class ModelRunner:
         available_gpu_memory = get_available_gpu_memory(
             self.gpu_id, distributed=self.tp_size > 1
         )
-        head_dim = self.model_config.head_dim
-        head_num = self.model_config.get_num_kv_heads(self.tp_size)
-        cell_size = (
-            head_num
-            * head_dim
-            * self.model_config.num_hidden_layers
-            * 2
-            * torch._utils._element_size(self.dtype)
-        )
+        if (
+            self.model_config.attention_arch == AttentionArch.MLA
+            and self.server_args.enable_mla
+        ):
+            cell_size = (
+                (self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim)
+                * self.model_config.num_hidden_layers
+                * torch._utils._element_size(self.dtype)
+            )
+        else:
+            cell_size = (
+                self.model_config.get_num_kv_heads(self.tp_size)
+                * self.model_config.head_dim
+                * self.model_config.num_hidden_layers
+                * 2
+                * torch._utils._element_size(self.dtype)
+            )
         rest_memory = available_gpu_memory - total_gpu_memory * (
             1 - self.mem_fraction_static
         )
         max_num_token = int(rest_memory * (1 << 30) // cell_size)
         return max_num_token
 
-    def init_memory_pool(self, total_gpu_memory, max_num_reqs=None):
+    def init_memory_pool(
+        self, total_gpu_memory, max_num_reqs=None, max_total_tokens=None
+    ):
         self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
+        if max_total_tokens is not None:
+            if max_total_tokens > self.max_total_num_tokens:
+                warnings.warn(
+                    f"max_total_tokens={max_total_tokens} is larger than the profiled value "
+                    f"{self.max_total_num_tokens}. "
+                    f"Use the profiled value instead."
+                )
+            self.max_total_num_tokens = min(self.max_total_num_tokens, max_total_tokens)
 
         if self.max_total_num_tokens <= 0:
             raise RuntimeError(
@@ -225,13 +257,28 @@ class ModelRunner:
             max_num_reqs,
             self.model_config.context_len + 8,
         )
-        self.token_to_kv_pool = TokenToKVPool(
-            self.max_total_num_tokens,
-            dtype=self.dtype,
-            head_num=self.model_config.get_num_kv_heads(self.tp_size),
-            head_dim=self.model_config.head_dim,
-            layer_num=self.model_config.num_hidden_layers,
-        )
+        if (
+            self.model_config.attention_arch == AttentionArch.MLA
+            and self.server_args.enable_mla
+        ):
+            self.token_to_kv_pool = MLATokenToKVPool(
+                self.max_total_num_tokens,
+                dtype=self.dtype,
+                kv_lora_rank=self.model_config.kv_lora_rank,
+                qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+                layer_num=self.model_config.num_hidden_layers,
+            )
+            logger.info("using MLA Triton implementaion, flashinfer is disabled")
+            # FIXME: temporarily only Triton MLA is supported
+            self.server_args.disable_flashinfer = True
+        else:
+            self.token_to_kv_pool = MHATokenToKVPool(
+                self.max_total_num_tokens,
+                dtype=self.dtype,
+                head_num=self.model_config.get_num_kv_heads(self.tp_size),
+                head_dim=self.model_config.head_dim,
+                layer_num=self.model_config.num_hidden_layers,
+            )
         logger.info(
             f"[gpu={self.gpu_id}] Memory pool end. "
             f"avail mem={get_available_gpu_memory(self.gpu_id):.2f} GB"
@@ -246,7 +293,7 @@ class ModelRunner:
         c = a @ b
         return c
 
-    def init_flash_infer(self):
+    def init_flashinfer(self):
         if self.server_args.disable_flashinfer:
             self.flashinfer_prefill_wrapper_ragged = None
             self.flashinfer_prefill_wrapper_paged = None
@@ -296,72 +343,51 @@ class ModelRunner:
             self.cuda_graph_runner.capture(batch_size_list)
         except RuntimeError as e:
             raise Exception(
-                f"Capture cuda graph failed: {e}. Possible solutions:\n"
-                f"1. disable cuda graph by --disable-cuda-graph\n"
-                f"2. set --mem-fraction-static to a smaller value\n"
-                f"Open an issue on GitHub with reproducible scripts if you need help.\n"
+                f"Capture cuda graph failed: {e}\n"
+                "Possible solutions:\n"
+                "1. disable torch compile by not using --enable-torch-compile\n"
+                "2. disable cuda graph by --disable-cuda-graph\n"
+                "3. set --mem-fraction-static to a smaller value\n"
+                "Open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose \n"
             )
 
     @torch.inference_mode()
-    def forward_decode(self, batch: Batch):
+    def forward_decode(self, batch: ScheduleBatch):
         if self.cuda_graph_runner and self.cuda_graph_runner.can_run(len(batch.reqs)):
             return self.cuda_graph_runner.replay(batch)
 
-        input_metadata = InputMetadata.create(
-            self,
-            forward_mode=ForwardMode.DECODE,
-            req_pool_indices=batch.req_pool_indices,
-            seq_lens=batch.seq_lens,
-            prefix_lens=batch.prefix_lens,
-            position_ids_offsets=batch.position_ids_offsets,
-            out_cache_loc=batch.out_cache_loc,
-            top_logprobs_nums=batch.top_logprobs_nums,
-            return_logprob=batch.return_logprob,
+        input_metadata = InputMetadata.from_schedule_batch(
+            self, batch, ForwardMode.DECODE
+        )
+
+        return self.model.forward(
+            batch.input_ids, input_metadata.positions, input_metadata
+        )
+
+    @torch.inference_mode()
+    def forward_extend(self, batch: ScheduleBatch):
+        input_metadata = InputMetadata.from_schedule_batch(
+            self, batch, forward_mode=ForwardMode.EXTEND
         )
         return self.model.forward(
             batch.input_ids, input_metadata.positions, input_metadata
         )
 
     @torch.inference_mode()
-    def forward_extend(self, batch: Batch):
-        input_metadata = InputMetadata.create(
-            self,
-            forward_mode=ForwardMode.EXTEND,
-            req_pool_indices=batch.req_pool_indices,
-            seq_lens=batch.seq_lens,
-            prefix_lens=batch.prefix_lens,
-            position_ids_offsets=batch.position_ids_offsets,
-            out_cache_loc=batch.out_cache_loc,
-            top_logprobs_nums=batch.top_logprobs_nums,
-            return_logprob=batch.return_logprob,
-        )
-        return self.model.forward(
-            batch.input_ids, input_metadata.positions, input_metadata
-        )
-
-    @torch.inference_mode()
-    def forward_extend_multi_modal(self, batch: Batch):
-        input_metadata = InputMetadata.create(
-            self,
-            forward_mode=ForwardMode.EXTEND,
-            req_pool_indices=batch.req_pool_indices,
-            seq_lens=batch.seq_lens,
-            prefix_lens=batch.prefix_lens,
-            position_ids_offsets=batch.position_ids_offsets,
-            out_cache_loc=batch.out_cache_loc,
-            return_logprob=batch.return_logprob,
-            top_logprobs_nums=batch.top_logprobs_nums,
+    def forward_extend_multi_modal(self, batch: ScheduleBatch):
+        input_metadata = InputMetadata.from_schedule_batch(
+            self, batch, forward_mode=ForwardMode.EXTEND
         )
         return self.model.forward(
             batch.input_ids,
             input_metadata.positions,
             input_metadata,
-            batch.pixel_values,
-            batch.image_sizes,
-            batch.image_offsets,
+            input_metadata.pixel_values,
+            input_metadata.image_sizes,
+            input_metadata.image_offsets,
         )
 
-    def forward(self, batch: Batch, forward_mode: ForwardMode):
+    def forward(self, batch: ScheduleBatch, forward_mode: ForwardMode):
         if self.is_multimodal_model and forward_mode == ForwardMode.EXTEND:
             return self.forward_extend_multi_modal(batch)
         elif forward_mode == ForwardMode.DECODE:
@@ -386,8 +412,10 @@ def import_model_classes():
                     entry, list
                 ):  # To support multiple model classes in one module
                     for tmp in entry:
+                        assert tmp.__name__ not in model_arch_name_to_cls
                         model_arch_name_to_cls[tmp.__name__] = tmp
                 else:
+                    assert entry.__name__ not in model_arch_name_to_cls
                     model_arch_name_to_cls[entry.__name__] = entry
 
             # compat: some models such as chatglm has incorrect class set in config.json
@@ -397,6 +425,7 @@ def import_model_classes():
             ):
                 for remap in module.EntryClassRemapping:
                     if isinstance(remap, tuple) and len(remap) == 2:
+                        assert remap[0] not in model_arch_name_to_cls
                         model_arch_name_to_cls[remap[0]] = remap[1]
 
     return model_arch_name_to_cls

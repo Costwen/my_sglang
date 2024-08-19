@@ -21,7 +21,7 @@ import dataclasses
 import logging
 import multiprocessing as mp
 import os
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Union
 
 import numpy as np
 import transformers
@@ -38,16 +38,19 @@ from sglang.srt.hf_transformers_utils import (
 )
 from sglang.srt.managers.io_struct import (
     AbortReq,
+    BatchEmbeddingOut,
     BatchStrOut,
     BatchTokenIDOut,
+    EmbeddingReqInput,
     FlushCacheReq,
     GenerateReqInput,
+    TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
 from sglang.srt.mm_utils import expand2square, process_anyres_image
 from sglang.srt.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import is_multimodal_model, load_image
+from sglang.srt.utils import is_generation_model, is_multimodal_model, load_image
 from sglang.utils import get_exception_traceback
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -79,11 +82,13 @@ class TokenizerManager:
         self.send_to_router.connect(f"tcp://127.0.0.1:{port_args.controller_port}")
 
         self.model_path = server_args.model_path
+        self.served_model_name = server_args.served_model_name
         self.hf_config = get_config(
             self.model_path,
             trust_remote_code=server_args.trust_remote_code,
             model_overide_args=model_overide_args,
         )
+        self.is_generation = is_generation_model(self.hf_config.architectures)
 
         if server_args.context_length is not None:
             self.context_len = server_args.context_length
@@ -152,7 +157,9 @@ class TokenizerManager:
                 image_data, aspect_ratio, grid_pinpoints, self.processor
             )
 
-    async def generate_request(self, obj: GenerateReqInput, request=None):
+    async def generate_request(
+        self, obj: Union[GenerateReqInput, EmbeddingReqInput], request=None
+    ):
         if self.to_create_loop:
             self.create_handle_loop()
 
@@ -163,6 +170,8 @@ class TokenizerManager:
             async for response in self._handle_single_request(obj, request):
                 yield response
         else:
+            if isinstance(obj, EmbeddingReqInput):
+                raise NotImplementedError("Please send only one prompt in each request")
             if obj.stream:
                 raise ValueError("Do not support stream for batch mode.")
 
@@ -170,45 +179,67 @@ class TokenizerManager:
                 yield response
 
     async def _handle_single_request(
-        self, obj, request, index=None, is_cache_for_prefill=False
+        self,
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        request,
+        index=None,
+        is_cache_for_prefill=False,
     ):
-        if not is_cache_for_prefill:
-            not_use_index = not (index is not None)
+        if not is_cache_for_prefill:  # The normal case with a single prompt
+            not_use_index = index is None
+
             rid = obj.rid if not_use_index else obj.rid[index]
             input_text = obj.text if not_use_index else obj.text[index]
-            input_ids = (
-                self.tokenizer.encode(input_text)
-                if obj.input_ids is None
-                else obj.input_ids
-            )
-            if not not_use_index and obj.input_ids:
-                input_ids = obj.input_ids[index]
+            if obj.input_ids is None:
+                input_ids = self.tokenizer.encode(input_text)
+            else:
+                input_ids = obj.input_ids if not_use_index else obj.input_ids[index]
 
             self._validate_input_length(input_ids)
 
             sampling_params = self._get_sampling_params(
                 obj.sampling_params if not_use_index else obj.sampling_params[index]
             )
-            pixel_values, image_hash, image_size = await self._get_pixel_values(
-                obj.image_data if not_use_index else obj.image_data[index]
-            )
-            return_logprob = (
-                obj.return_logprob if not_use_index else obj.return_logprob[index]
-            )
-            logprob_start_len = (
-                obj.logprob_start_len if not_use_index else obj.logprob_start_len[index]
-            )
-            top_logprobs_num = (
-                obj.top_logprobs_num if not_use_index else obj.top_logprobs_num[index]
-            )
-        else:
-            if isinstance(obj.text, list):
-                input_text = obj.text[index]
-                rid = obj.rid[index]
+
+            if self.is_generation:
+                pixel_values, image_hash, image_size = await self._get_pixel_values(
+                    obj.image_data if not_use_index else obj.image_data[index]
+                )
+                return_logprob = (
+                    obj.return_logprob if not_use_index else obj.return_logprob[index]
+                )
+                logprob_start_len = (
+                    obj.logprob_start_len
+                    if not_use_index
+                    else obj.logprob_start_len[index]
+                )
+                top_logprobs_num = (
+                    obj.top_logprobs_num
+                    if not_use_index
+                    else obj.top_logprobs_num[index]
+                )
+        else:  # A prefill request to cache the common prompt for parallel sampling
+            assert self.is_generation
+            if obj.text is not None:
+                if isinstance(obj.text, list):
+                    input_text = obj.text[index]
+                    rid = obj.rid[index]
+                else:
+                    input_text = obj.text
+                    rid = obj.rid[0]
+                input_ids = self.tokenizer.encode(input_text)
             else:
-                input_text = obj.text
-                rid = obj.rid[0]
-            input_ids = self.tokenizer.encode(input_text)
+                input_text = None
+                if isinstance(obj.input_ids, list) and isinstance(
+                    obj.input_ids[0], list
+                ):
+                    # when obj["input_ids"] is List[List[int]]
+                    input_ids = obj.input_ids[index]
+                    rid = obj.rid[index]
+                else:
+                    input_ids = obj.input_ids
+                    rid = obj.rid[0]
+
             sampling_params = SamplingParams(**obj.sampling_params[0])
             sampling_params.max_new_tokens = 0
             pixel_values, image_hash, image_size = await self._get_pixel_values(
@@ -217,20 +248,29 @@ class TokenizerManager:
             return_logprob = obj.return_logprob[0]
             logprob_start_len = obj.logprob_start_len[0]
             top_logprobs_num = obj.top_logprobs_num[0]
-        
-        tokenized_obj = TokenizedGenerateReqInput(
-            rid,
-            input_text,
-            input_ids,
-            pixel_values,
-            image_hash,
-            image_size,
-            sampling_params,
-            return_logprob,
-            logprob_start_len,
-            top_logprobs_num,
-            obj.stream,
-        )
+
+        if self.is_generation:
+            tokenized_obj = TokenizedGenerateReqInput(
+                rid,
+                input_text,
+                input_ids,
+                pixel_values,
+                image_hash,
+                image_size,
+                sampling_params,
+                return_logprob,
+                logprob_start_len,
+                top_logprobs_num,
+                obj.stream,
+            )
+        else:  # is embedding
+            tokenized_obj = TokenizedEmbeddingReqInput(
+                rid,
+                input_text,
+                input_ids,
+                sampling_params,
+            )
+
         self.send_to_router.send_pyobj(tokenized_obj)
 
         event = asyncio.Event()
@@ -259,11 +299,11 @@ class TokenizerManager:
                 ):
                     if input_id_result is not None:
                         input_id_result.append(input_id)
-                    pass
-            if len(input_id_result) > 1 and input_id_result is not None:
+            if input_id_result is not None and len(input_id_result) > 1:
                 obj.input_ids = input_id_result
             elif input_id_result is not None:
                 obj.input_ids = input_id_result[0]
+
         # First send out all requests
         for i in range(batch_size):
             for j in range(parallel_sample_num):
@@ -283,11 +323,12 @@ class TokenizerManager:
                         input_text = None
                         input_ids = obj.input_ids[i]
                 else:
+                    assert obj.input_ids is not None
                     if batch_size == 1:
-                        input_text = obj.text
+                        input_text = None
                         input_ids = obj.input_ids
                     else:
-                        input_text = obj.text[i]
+                        input_text = None
                         input_ids = obj.input_ids[i]
                 sampling_params = self._get_sampling_params(obj.sampling_params[index])
                 pixel_values, image_hash, image_size = await self._get_pixel_values(
@@ -312,7 +353,6 @@ class TokenizerManager:
                 event = asyncio.Event()
                 state = ReqState([], False, event)
                 self.rid_to_state[rid] = state
-
         # Then wait for all responses
         output_list = []
         for i in range(batch_size):
@@ -345,7 +385,6 @@ class TokenizerManager:
                 )
                 assert state.finished
                 del self.rid_to_state[rid]
-
         yield output_list
 
     def _validate_input_length(self, input_ids: List[int]):
@@ -374,7 +413,7 @@ class TokenizerManager:
         self,
         event: asyncio.Event,
         state: ReqState,
-        obj: GenerateReqInput,
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
         rid: str,
         request,
     ):
@@ -387,15 +426,23 @@ class TokenizerManager:
                     raise ValueError(f"Abort request {rid}")
                 continue
 
-            out = self.convert_logprob_style(
-                state.out_list[-1],
-                obj.return_logprob,
-                obj.top_logprobs_num,
-                obj.return_text_in_logprobs,
-            )
+            if self.is_generation:
+                out = self.convert_logprob_style(
+                    state.out_list[-1],
+                    obj.return_logprob,
+                    obj.top_logprobs_num,
+                    obj.return_text_in_logprobs,
+                )
+            else:  # isinstance(obj, EmbeddingReqInput)
+                out = state.out_list[-1]
 
+            # Log requests
             if self.server_args.log_requests and state.finished:
-                logger.info(f"in={obj.text}, out={out}")
+                if obj.text is None:
+                    in_obj = {"text": self.tokenizer.decode(obj.input_ids)}
+                else:
+                    in_obj = {"text": obj.text}
+                logger.info(f"in={in_obj}, out={out}")
 
             state.out_list = []
             if state.finished:
@@ -460,8 +507,10 @@ class TokenizerManager:
 
     async def handle_loop(self):
         while True:
-            recv_obj: BatchTokenIDOut = await self.recv_from_detokenizer.recv_pyobj()
-            assert isinstance(recv_obj, BatchStrOut)
+            recv_obj: Union[BatchStrOut, BatchEmbeddingOut] = (
+                await self.recv_from_detokenizer.recv_pyobj()
+            )
+            assert isinstance(recv_obj, (BatchStrOut, BatchEmbeddingOut))
 
             for i, rid in enumerate(recv_obj.rids):
                 state = self.rid_to_state.get(rid, None)
@@ -469,10 +518,17 @@ class TokenizerManager:
                     continue
 
                 recv_obj.meta_info[i]["id"] = rid
-                out_dict = {
-                    "text": recv_obj.output_strs[i],
-                    "meta_info": recv_obj.meta_info[i],
-                }
+                if isinstance(recv_obj, BatchStrOut):
+                    out_dict = {
+                        "text": recv_obj.output_strs[i],
+                        "meta_info": recv_obj.meta_info[i],
+                    }
+                else:
+                    assert isinstance(recv_obj, BatchEmbeddingOut)
+                    out_dict = {
+                        "embedding": recv_obj.embeddings[i],
+                        "meta_info": recv_obj.meta_info[i],
+                    }
                 state.out_list.append(out_dict)
                 state.finished = recv_obj.finished_reason[i] is not None
                 state.event.set()

@@ -28,7 +28,7 @@ import sys
 import threading
 import time
 from http import HTTPStatus
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Union
 
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
@@ -52,13 +52,14 @@ from sglang.srt.managers.controller_single import (
     start_controller_process as start_controller_process_single,
 )
 from sglang.srt.managers.detokenizer_manager import start_detokenizer_process
-from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.openai_api.adapter import (
     load_chat_template_for_openai_api,
     v1_batches,
     v1_chat_completions,
     v1_completions,
+    v1_delete_file,
     v1_files_create,
     v1_retrieve_batch,
     v1_retrieve_file,
@@ -67,11 +68,11 @@ from sglang.srt.openai_api.adapter import (
 from sglang.srt.openai_api.protocol import ModelCard, ModelList
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
-    API_KEY_HEADER_NAME,
-    APIKeyValidatorMiddleware,
+    add_api_key_middleware,
     allocate_init_ports,
     assert_pkg_version,
     enable_show_time_cost,
+    kill_child_process,
     maybe_set_triton_cache_manager,
     set_ulimit,
 )
@@ -96,6 +97,7 @@ async def health() -> Response:
 async def get_model_info():
     result = {
         "model_path": tokenizer_manager.model_path,
+        "is_generation": tokenizer_manager.is_generation,
     }
     return result
 
@@ -147,6 +149,21 @@ app.post("/generate")(generate_request)
 app.put("/generate")(generate_request)
 
 
+async def encode_request(obj: EmbeddingReqInput, request: Request):
+    """Handle an embedding request."""
+    try:
+        ret = await tokenizer_manager.generate_request(obj, request).__anext__()
+        return ret
+    except ValueError as e:
+        return JSONResponse(
+            {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
+        )
+
+
+app.post("/encode")(encode_request)
+app.put("/encode")(encode_request)
+
+
 @app.post("/v1/completions")
 async def openai_v1_completions(raw_request: Request):
     return await v1_completions(tokenizer_manager, raw_request)
@@ -157,11 +174,27 @@ async def openai_v1_chat_completions(raw_request: Request):
     return await v1_chat_completions(tokenizer_manager, raw_request)
 
 
+@app.get("/v1/models")
+def available_models():
+    """Show available models."""
+    served_model_names = [tokenizer_manager.served_model_name]
+    model_cards = []
+    for served_model_name in served_model_names:
+        model_cards.append(ModelCard(id=served_model_name, root=served_model_name))
+    return ModelList(data=model_cards)
+
+
 @app.post("/v1/files")
 async def openai_v1_files(file: UploadFile = File(...), purpose: str = Form("batch")):
     return await v1_files_create(
         file, purpose, tokenizer_manager.server_args.file_storage_pth
     )
+
+
+@app.delete("/v1/files/{file_id}")
+async def delete_file(file_id: str):
+    # https://platform.openai.com/docs/api-reference/files/delete
+    return await v1_delete_file(file_id)
 
 
 @app.post("/v1/batches")
@@ -186,69 +219,11 @@ async def retrieve_file_content(file_id: str):
     return await v1_retrieve_file_content(file_id)
 
 
-@app.get("/v1/models")
-def available_models():
-    """Show available models."""
-    model_names = [tokenizer_manager.model_path]
-    model_cards = []
-    for model_name in model_names:
-        model_cards.append(ModelCard(id=model_name, root=model_name))
-    return ModelList(data=model_cards)
-
-
-def _set_torch_compile_config():
-    # The following configurations are for torch compile optimizations
-    import torch._dynamo.config
-    import torch._inductor.config
-
-    torch._inductor.config.coordinate_descent_tuning = True
-    torch._inductor.config.triton.unique_kernel_names = True
-    torch._inductor.config.fx_graph_cache = True  # Experimental feature to reduce compilation times, will be on by default in future
-
-    # FIXME: tmp workaround
-    torch._dynamo.config.accumulated_cache_size_limit = 256
-
-
-def set_envs_and_config(server_args: ServerArgs):
-    # Set global environments
-    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-    os.environ["NCCL_CUMEM_ENABLE"] = "0"
-    os.environ["NCCL_NVLS_ENABLE"] = "0"
-    os.environ["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"
-
-    # Set ulimit
-    set_ulimit()
-
-    # Enable show time cost for debugging
-    if server_args.show_time_cost:
-        enable_show_time_cost()
-
-    # Disable disk cache
-    if server_args.disable_disk_cache:
-        disable_cache()
-
-    # Fix triton bugs
-    if server_args.tp_size * server_args.dp_size > 1:
-        # FIXME: remove this after https://github.com/triton-lang/triton/pull/4295 is used as a dependency.
-        maybe_set_triton_cache_manager()
-
-    # Set torch compile config
-    if server_args.enable_torch_compile:
-        _set_torch_compile_config()
-
-    # Set global chat template
-    if server_args.chat_template:
-        # TODO: replace this with huggingface transformers template
-        load_chat_template_for_openai_api(server_args.chat_template)
-
-
 def launch_server(
     server_args: ServerArgs,
     model_overide_args: Optional[dict] = None,
     pipe_finish_writer: Optional[mp.connection.Connection] = None,
 ):
-    server_args.check_server_args()
-
     """Launch an HTTP server."""
     global tokenizer_manager
 
@@ -257,16 +232,8 @@ def launch_server(
         format="%(message)s",
     )
 
-    if not server_args.disable_flashinfer:
-        assert_pkg_version(
-            "flashinfer",
-            "0.1.2",
-            "Please uninstall the old version and "
-            "reinstall the latest version by following the instructions "
-            "at https://docs.flashinfer.ai/installation.html.",
-        )
-
-    set_envs_and_config(server_args)
+    server_args.check_server_args()
+    _set_envs_and_config(server_args)
 
     # Allocate ports
     server_args.port, server_args.additional_ports = allocate_init_ports(
@@ -283,7 +250,7 @@ def launch_server(
     )
     logger.info(f"{server_args=}")
 
-    # Handle multi-node tensor parallelism
+    # Launch processes for multi-node tensor parallelism
     if server_args.nnodes > 1:
         if server_args.node_rank != 0:
             tp_size_local = server_args.tp_size // server_args.nnodes
@@ -348,8 +315,9 @@ def launch_server(
         sys.exit(1)
     assert proc_controller.is_alive() and proc_detoken.is_alive()
 
-    if server_args.api_key and server_args.api_key != "":
-        app.add_middleware(APIKeyValidatorMiddleware, api_key=server_args.api_key)
+    # Add api key authorization
+    if server_args.api_key:
+        add_api_key_middleware(app, server_args.api_key)
 
     # Send a warmup request
     t = threading.Thread(
@@ -371,42 +339,95 @@ def launch_server(
         t.join()
 
 
+def _set_envs_and_config(server_args: ServerArgs):
+    # Set global environments
+    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+    os.environ["NCCL_CUMEM_ENABLE"] = "0"
+    os.environ["NCCL_NVLS_ENABLE"] = "0"
+    os.environ["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"
+
+    # Set ulimit
+    set_ulimit()
+
+    # Enable show time cost for debugging
+    if server_args.show_time_cost:
+        enable_show_time_cost()
+
+    # Disable disk cache
+    if server_args.disable_disk_cache:
+        disable_cache()
+
+    # Fix triton bugs
+    if server_args.tp_size * server_args.dp_size > 1:
+        # FIXME: remove this after https://github.com/triton-lang/triton/pull/4295 is used as a dependency.
+        maybe_set_triton_cache_manager()
+
+    # Set global chat template
+    if server_args.chat_template:
+        # TODO: replace this with huggingface transformers template
+        load_chat_template_for_openai_api(server_args.chat_template)
+
+    # Check flashinfer version
+    if not server_args.disable_flashinfer:
+        assert_pkg_version(
+            "flashinfer",
+            "0.1.3",
+            "Please uninstall the old version and "
+            "reinstall the latest version by following the instructions "
+            "at https://docs.flashinfer.ai/installation.html.",
+        )
+
+
 def _wait_and_warmup(server_args, pipe_finish_writer):
     headers = {}
     url = server_args.url()
     if server_args.api_key:
-        headers[API_KEY_HEADER_NAME] = server_args.api_key
+        headers["Authorization"] = f"Bearer {server_args.api_key}"
 
     # Wait until the server is launched
+    success = False
     for _ in range(120):
-        time.sleep(0.5)
+        time.sleep(1)
         try:
-            requests.get(url + "/get_model_info", timeout=5, headers=headers)
+            res = requests.get(url + "/get_model_info", timeout=5, headers=headers)
+            assert res.status_code == 200, f"{res}"
+            success = True
             break
-        except requests.exceptions.RequestException:
+        except (AssertionError, requests.exceptions.RequestException) as e:
+            last_traceback = get_exception_traceback()
             pass
+    model_info = res.json()
+
+    if not success:
+        if pipe_finish_writer is not None:
+            pipe_finish_writer.send(last_traceback)
+        print(f"Initialization failed. warmup error: {last_traceback}", flush=True)
+        sys.exit(1)
 
     # Send a warmup request
+    request_name = "/generate" if model_info["is_generation"] else "/encode"
+    max_new_tokens = 8 if model_info["is_generation"] else 0
     try:
         for _ in range(server_args.dp_size):
             res = requests.post(
-                url + "/generate",
+                url + request_name,
                 json={
                     "text": "The capital city of France is",
                     "sampling_params": {
                         "temperature": 0,
-                        "max_new_tokens": 8,
+                        "max_new_tokens": max_new_tokens,
                     },
                 },
                 headers=headers,
                 timeout=600,
             )
-            assert res.status_code == 200
+            assert res.status_code == 200, f"{res}"
     except Exception as e:
+        last_traceback = get_exception_traceback()
         if pipe_finish_writer is not None:
-            pipe_finish_writer.send(get_exception_traceback())
-        print(f"Initialization failed. warmup error: {e}", flush=True)
-        raise e
+            pipe_finish_writer.send(last_traceback)
+        print(f"Initialization failed. warmup error: {last_traceback}", flush=True)
+        sys.exit(1)
 
     logger.info("The server is fired up and ready to roll!")
     if pipe_finish_writer is not None:
@@ -467,17 +488,11 @@ class Runtime:
 
     def shutdown(self):
         if self.pid is not None:
-            try:
-                parent = psutil.Process(self.pid)
-            except psutil.NoSuchProcess:
-                return
-            children = parent.children(recursive=True)
-            for child in children:
-                child.kill()
-            psutil.wait_procs(children, timeout=5)
-            parent.kill()
-            parent.wait(timeout=5)
+            kill_child_process(self.pid)
             self.pid = None
+
+    def cache_prefix(self, prefix: str):
+        self.endpoint.cache_prefix(prefix)
 
     def get_tokenizer(self):
         return get_tokenizer(
@@ -486,10 +501,10 @@ class Runtime:
             trust_remote_code=self.server_args.trust_remote_code,
         )
 
-    async def add_request(
+    async def async_generate(
         self,
         prompt: str,
-        sampling_params: Dict,
+        sampling_params: Optional[Dict] = None,
     ):
         json_data = {
             "text": prompt,
@@ -511,6 +526,40 @@ class Runtime:
                         if cur:
                             yield cur
                         pos += len(cur)
+
+    add_request = async_generate
+
+    def generate(
+        self,
+        prompt: str,
+        sampling_params: Optional[Dict] = None,
+        return_logprob: Optional[Union[List[bool], bool]] = False,
+        top_logprobs_num: Optional[Union[List[int], int]] = None,
+    ):
+        json_data = {
+            "text": prompt,
+            "sampling_params": sampling_params,
+            "return_logprob": return_logprob,
+            "top_logprobs_num": top_logprobs_num,
+        }
+        response = requests.post(
+            self.url + "/generate",
+            json=json_data,
+        )
+        return json.dumps(response.json())
+
+    def encode(
+        self,
+        prompt: str,
+    ):
+        json_data = {
+            "text": prompt,
+        }
+        response = requests.post(
+            self.url + "/encode",
+            json=json_data,
+        )
+        return json.dumps(response.json())
 
     def __del__(self):
         self.shutdown()

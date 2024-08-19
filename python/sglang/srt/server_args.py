@@ -33,6 +33,7 @@ class ServerArgs:
     trust_remote_code: bool = True
     context_length: Optional[int] = None
     quantization: Optional[str] = None
+    served_model_name: Optional[str] = None
     chat_template: Optional[str] = None
 
     # Port
@@ -45,6 +46,7 @@ class ServerArgs:
     max_prefill_tokens: Optional[int] = None
     max_running_requests: Optional[int] = None
     max_num_reqs: Optional[int] = None
+    max_total_tokens: Optional[int] = None
     schedule_policy: str = "lpm"
     schedule_conservativeness: float = 1.0
 
@@ -60,7 +62,7 @@ class ServerArgs:
     show_time_cost: bool = False
 
     # Other
-    api_key: str = ""
+    api_key: Optional[str] = None
     file_storage_pth: str = "SGlang_storage"
 
     # Data parallelism
@@ -79,6 +81,7 @@ class ServerArgs:
     disable_disk_cache: bool = False
     enable_torch_compile: bool = False
     enable_p2p_check: bool = False
+    enable_mla: bool = False
     attention_reduce_in_fp32: bool = False
     efficient_weight_load: bool = False
 
@@ -90,6 +93,10 @@ class ServerArgs:
     def __post_init__(self):
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path
+
+        if self.served_model_name is None:
+            self.served_model_name = self.model_path
+
         if self.mem_fraction_static is None:
             if self.tp_size >= 16:
                 self.mem_fraction_static = 0.79
@@ -203,6 +210,12 @@ class ServerArgs:
             help="The quantization method.",
         )
         parser.add_argument(
+            "--served-model-name",
+            type=str,
+            default=ServerArgs.served_model_name,
+            help="Override the model name returned by the v1/models endpoint in OpenAI API server.",
+        )
+        parser.add_argument(
             "--chat-template",
             type=str,
             default=ServerArgs.chat_template,
@@ -233,6 +246,12 @@ class ServerArgs:
             help="The maximum number of requests to serve in the memory pool. If the model have a large context length, you may need to decrease this value to avoid out-of-memory errors.",
         )
         parser.add_argument(
+            "--max-total-tokens",
+            type=int,
+            default=ServerArgs.max_total_tokens,
+            help="The maximum number of tokens in the memory pool. If not specified, it will be automatically calculated based on the memory usage fraction. This option is typically used for development and debugging purposes.",
+        )
+        parser.add_argument(
             "--schedule-policy",
             type=str,
             default=ServerArgs.schedule_policy,
@@ -246,6 +265,7 @@ class ServerArgs:
             help="How conservative the schedule policy is. A larger value means more conservative scheduling. Use a larger value if you see requests being retracted frequently.",
         )
         parser.add_argument(
+            "--tensor-parallel-size",
             "--tp-size",
             type=int,
             default=ServerArgs.tp_size,
@@ -289,7 +309,7 @@ class ServerArgs:
             "--api-key",
             type=str,
             default=ServerArgs.api_key,
-            help="Set API key of the server.",
+            help="Set API key of the server. It is also used in the OpenAI API compatible server.",
         )
         parser.add_argument(
             "--file-storage-pth",
@@ -300,6 +320,7 @@ class ServerArgs:
 
         # Data parallelism
         parser.add_argument(
+            "--data-parallel-size",
             "--dp-size",
             type=int,
             default=ServerArgs.dp_size,
@@ -377,6 +398,11 @@ class ServerArgs:
             help="Enable P2P check for GPU access, otherwise the p2p access is allowed by default.",
         )
         parser.add_argument(
+            "--enable-mla",
+            action="store_true",
+            help="Enable Multi-head Latent Attention (MLA) for DeepSeek-V2",
+        )
+        parser.add_argument(
             "--attention-reduce-in-fp32",
             action="store_true",
             help="Cast the intermidiate attention results to fp32 to avoid possible crashes related to fp16."
@@ -390,6 +416,8 @@ class ServerArgs:
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
+        args.tp_size = args.tensor_parallel_size
+        args.dp_size = args.data_parallel_size
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
@@ -412,10 +440,6 @@ class ServerArgs:
         assert not (
             self.dp_size > 1 and self.node_rank is not None
         ), "multi-node data parallel is not supported"
-
-        assert not (
-            self.chunked_prefill_size is not None and self.disable_radix_cache
-        ), "chunked prefill is not supported with radix cache disabled currently"
 
 
 @dataclasses.dataclass

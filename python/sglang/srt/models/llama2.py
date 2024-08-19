@@ -26,6 +26,11 @@ from vllm.config import CacheConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.linear import (
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -34,13 +39,9 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
-from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.logits_processor import LogitProcessorOutput, LogitsProcessor
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.model_executor.model_runner import InputMetadata
-
-MergedColumnParallelLinear = None
-QKVParallelLinear = None
-RowParallelLinear = None
+from sglang.srt.model_executor.forward_batch_info import InputMetadata
 
 
 class LlamaMLP(nn.Module):
@@ -295,23 +296,6 @@ class LlamaForCausalLM(nn.Module):
         cache_config: Optional[CacheConfig] = None,
         efficient_weight_load=False,
     ) -> None:
-        global MergedColumnParallelLinear
-        global QKVParallelLinear
-        global RowParallelLinear
-
-        if efficient_weight_load:
-            from sglang.srt.layers.linear import (
-                MergedColumnParallelLinear,
-                QKVParallelLinear,
-                RowParallelLinear,
-            )
-        else:
-            from vllm.model_executor.layers.linear import (
-                MergedColumnParallelLinear,
-                QKVParallelLinear,
-                RowParallelLinear,
-            )
-
         super().__init__()
         self.config = config
         self.quant_config = quant_config
@@ -326,7 +310,7 @@ class LlamaForCausalLM(nn.Module):
         positions: torch.Tensor,
         input_metadata: InputMetadata,
         input_embeds: torch.Tensor = None,
-    ) -> torch.Tensor:
+    ) -> LogitProcessorOutput:
         hidden_states = self.model(input_ids, positions, input_metadata, input_embeds)
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head.weight, input_metadata
