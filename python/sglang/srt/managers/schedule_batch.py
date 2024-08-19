@@ -18,19 +18,20 @@ limitations under the License.
 import logging
 import warnings
 from dataclasses import dataclass
-from typing import List, Union
+from typing import List, Optional, Union
 
-import numpy as np
 import torch
+import torch.distributed as dist
 from flashinfer.sampling import top_k_top_p_sampling_from_probs
+from vllm.distributed import get_tensor_model_parallel_group
 
 import sglang.srt.sampling.penaltylib as penaltylib
 from sglang.global_config import global_config
 from sglang.srt.constrained import RegexGuide
 from sglang.srt.constrained.jump_forward import JumpForwardMap
+from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
-from sglang.srt.mem_cache.radix_cache import RadixCache
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
@@ -99,7 +100,7 @@ class Req:
         self.origin_input_ids_unpadded = origin_input_ids  # Before image padding
         self.origin_input_ids = origin_input_ids
         self.output_ids = []  # Each decode stage's output ids
-        self.input_ids = None  # input_ids = origin_input_ids + output_ids
+        self.fill_ids = None  # fill_ids = origin_input_ids + output_ids
 
         # Memory info
         self.req_pool_idx = None
@@ -164,8 +165,17 @@ class Req:
     def finished(self) -> bool:
         return self.finished_reason is not None
 
+    def init_next_round_input(self, tree_cache: Optional[BasePrefixCache] = None):
+        self.fill_ids = self.origin_input_ids + self.output_ids
+        if tree_cache is not None:
+            self.prefix_indices, self.last_node = tree_cache.match_prefix(
+                rid=self.rid, key=self.adjust_max_prefix_ids()
+            )
+        self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
+
     def adjust_max_prefix_ids(self):
-        input_len = len(self.input_ids)
+        self.fill_ids = self.origin_input_ids + self.output_ids
+        input_len = len(self.fill_ids)
         max_prefix_len = input_len
 
         if self.sampling_params.max_new_tokens > 0:
@@ -179,7 +189,7 @@ class Req:
                 # Need at least two tokens to compute normalized logprob
                 max_prefix_len = min(max_prefix_len, input_len - 2)
 
-        return self.input_ids[:max_prefix_len]
+        return self.fill_ids[:max_prefix_len]
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
     def init_incremental_detokenize(self):
@@ -195,6 +205,8 @@ class Req:
         return all_ids[self.surr_offset :], self.read_offset - self.surr_offset
 
     def get_next_inc_detokenization(self):
+        if self.tokenizer is None:
+            return False, ""
         read_ids, read_offset = self.init_incremental_detokenize()
         surr_ids = read_ids[:read_offset]
 
@@ -225,16 +237,13 @@ class Req:
             return
 
         last_token_id = self.output_ids[-1]
-        if (
-            last_token_id == self.tokenizer.eos_token_id
-            and not self.sampling_params.ignore_eos
-        ):
-            self.finished_reason = FINISH_MATCHED_TOKEN(
-                matched=self.tokenizer.eos_token_id
-            )
-            return
 
-        if last_token_id in self.sampling_params.stop_token_ids:
+        matched_eos = last_token_id in self.sampling_params.stop_token_ids
+
+        if self.tokenizer is not None:
+            matched_eos |= last_token_id == self.tokenizer.eos_token_id
+
+        if matched_eos and not self.sampling_params.ignore_eos:
             self.finished_reason = FINISH_MATCHED_TOKEN(matched=last_token_id)
             return
 
@@ -310,7 +319,7 @@ class ScheduleBatch:
     reqs: List[Req]
     req_to_token_pool: ReqToTokenPool
     token_to_kv_pool: BaseTokenToKVPool
-    tree_cache: RadixCache
+    tree_cache: BasePrefixCache
 
     # Batched arguments to model runner
     input_ids: torch.Tensor = None
@@ -319,6 +328,9 @@ class ScheduleBatch:
     position_ids_offsets: torch.Tensor = None
     out_cache_loc: torch.Tensor = None
     extend_num_tokens: int = None
+
+    # For mixed chunekd prefill
+    prefix_lens_cpu: List[int] = None
 
     # For processing logprobs
     return_logprob: bool = False
@@ -378,7 +390,7 @@ class ScheduleBatch:
 
         return out_cache_loc
 
-    def batch_sampling_params(self, vocab_size, int_token_logit_bias):
+    def batch_sampling_params(self, vocab_size):
         device = "cuda"
         bs, reqs = self.batch_size(), self.reqs
         self.temperatures = torch.tensor(
@@ -414,18 +426,11 @@ class ScheduleBatch:
 
         # Handle logit bias but only allocate when needed
         self.logit_bias = None
-        for i in range(bs):
-            if reqs[i].sampling_params.dtype == "int":
-                if self.logit_bias is None:
-                    self.logit_bias = torch.zeros(
-                        (bs, vocab_size), dtype=torch.float32, device=device
-                    )
-                self.logit_bias[i][: len(int_token_logit_bias)] = int_token_logit_bias
 
-    def prepare_for_extend(self, vocab_size: int, int_token_logit_bias: torch.Tensor):
+    def prepare_for_extend(self, vocab_size: int):
         bs = self.batch_size()
         reqs = self.reqs
-        input_ids = [r.input_ids[len(r.prefix_indices) :] for r in reqs]
+        input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
         extend_num_tokens = sum(len(ids) for ids in input_ids)
         seq_lens = []
 
@@ -436,7 +441,7 @@ class ScheduleBatch:
         pt = 0
         for i, req in enumerate(reqs):
             req.req_pool_idx = req_pool_indices_cpu[i]
-            pre_len, seq_len = len(req.prefix_indices), len(req.input_ids)
+            pre_len, seq_len = len(req.prefix_indices), len(req.fill_ids)
             ext_len = seq_len - pre_len
             seq_lens.append(seq_len)
 
@@ -460,8 +465,32 @@ class ScheduleBatch:
         self.extend_num_tokens = extend_num_tokens
         self.out_cache_loc = out_cache_loc
         self.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
+        self.prefix_lens_cpu = [len(r.prefix_indices) for r in reqs]
 
-        self.batch_sampling_params(vocab_size, int_token_logit_bias)
+        self.batch_sampling_params(vocab_size)
+
+    def mix_with_running(self, running_batch: "ScheduleBatch"):
+        # NOTE: prefix_indices is what has been cached, but we don't cache each decode step
+        prefix_lens_cpu = [len(r.prefix_indices) for r in self.reqs]
+        prefix_lens_cpu.extend(
+            [
+                len(r.origin_input_ids) + len(r.output_ids) - 1
+                for r in running_batch.reqs
+            ]
+        )
+
+        for req in running_batch.reqs:
+            req.fill_ids = req.origin_input_ids + req.output_ids
+            req.extend_input_len = 1
+
+        input_ids = torch.cat([self.input_ids, running_batch.input_ids])
+        out_cache_loc = torch.cat([self.out_cache_loc, running_batch.out_cache_loc])
+        extend_num_tokens = self.extend_num_tokens + running_batch.batch_size()
+        self.merge(running_batch)
+        self.input_ids = input_ids
+        self.out_cache_loc = out_cache_loc
+        self.extend_num_tokens = extend_num_tokens
+        self.prefix_lens_cpu = prefix_lens_cpu
 
     def check_decode_mem(self):
         bs = self.batch_size()
@@ -532,7 +561,7 @@ class ScheduleBatch:
                 residual_size = max(0, residual_size)
                 self.tree_cache.evict(residual_size, self.token_to_kv_pool.free)
 
-            req.prefix_indices = None
+            req.prefix_indices = []
             req.last_node = None
             req.extend_input_len = 0
 
@@ -630,7 +659,8 @@ class ScheduleBatch:
     def prepare_for_decode(self, input_ids=None):
         if input_ids is None:
             input_ids = [
-                r.output_ids[-1] if r.output_ids else r.input_ids[-1] for r in self.reqs
+                r.output_ids[-1] if r.output_ids else r.origin_input_ids[-1]
+                for r in self.reqs
             ]
         else:
             self.penalizer_orchestrator.cumulate_input_tokens(input_ids)
@@ -679,6 +709,11 @@ class ScheduleBatch:
                 setattr(self, item, self_val[new_indices])
 
     def merge(self, other: "ScheduleBatch"):
+        # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
+        # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
+        # needs to be called with pre-merged Batch.reqs.
+        self.penalizer_orchestrator.merge(other.penalizer_orchestrator)
+
         self.reqs.extend(other.reqs)
 
         self.req_pool_indices = torch.concat(
@@ -691,8 +726,6 @@ class ScheduleBatch:
         self.out_cache_loc = None
         self.top_logprobs_nums.extend(other.top_logprobs_nums)
         self.return_logprob = any(req.return_logprob for req in self.reqs)
-
-        self.penalizer_orchestrator.merge(other.penalizer_orchestrator)
 
         for item in [
             "temperatures",
@@ -720,7 +753,7 @@ class ScheduleBatch:
                 )
             self.logit_bias = torch.concat([self.logit_bias, other.logit_bias])
 
-    def sample(self, logits: torch.Tensor):
+    def sample(self, logits: torch.Tensor, is_multi_node_tp=False):
         # TODO(lsyin): move this into a part of layer and run with CUDA Graph
         # Post process logits
         logits = logits.contiguous()
@@ -774,6 +807,16 @@ class ScheduleBatch:
                     )
 
         self.penalizer_orchestrator.cumulate_output_tokens(batch_next_token_ids)
+
+        if is_multi_node_tp:
+            # If the tensor parallelism spans across multiple nodes, there is some indeterminism
+            # that can cause the TP workers to generate different tokens, so we need to
+            # sync here
+            torch.distributed.all_reduce(
+                batch_next_token_ids,
+                op=dist.ReduceOp.MIN,
+                group=get_tensor_model_parallel_group().device_group,
+            )
 
         return batch_next_token_ids
 

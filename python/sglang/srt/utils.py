@@ -35,7 +35,6 @@ import torch
 import torch.distributed as dist
 from fastapi.responses import JSONResponse
 from packaging import version as pkg_version
-from starlette.middleware.base import BaseHTTPMiddleware
 from torch.nn.parameter import Parameter
 from triton.runtime.cache import (
     FileCacheManager,
@@ -197,6 +196,8 @@ def allocate_init_ports(
 def get_int_token_logit_bias(tokenizer, vocab_size):
     """Get the logit bias for integer-only tokens."""
     # a bug when model's vocab size > tokenizer.vocab_size
+    if tokenizer == None:
+        return [-1e5] * vocab_size
     vocab_size = tokenizer.vocab_size
     logit_bias = np.zeros(vocab_size, dtype=np.float32)
     for t_id in range(vocab_size):
@@ -647,7 +648,7 @@ def set_ulimit(target_soft_limit=65535):
             logger.warn(f"Fail to set RLIMIT_NOFILE: {e}")
 
 
-def is_llama3_405b_fp8(model_config):
+def is_llama3_405b_fp8_head_16(model_config):
     """Return whether the model is meta-llama/Meta-Llama-3.1-405B-FP8 with 16 kv heads."""
     if (
         model_config.hf_config.architectures[0] == "LlamaForCausalLM"
@@ -706,3 +707,23 @@ def add_api_key_middleware(app, api_key):
         if request.headers.get("Authorization") != "Bearer " + api_key:
             return JSONResponse(content={"error": "Unauthorized"}, status_code=401)
         return await call_next(request)
+
+
+def prepare_model(model_path):
+    if "SGLANG_USE_MODELSCOPE" in os.environ:
+        if not os.path.exists(model_path):
+            from modelscope import snapshot_download
+
+            return snapshot_download(model_path)
+    return model_path
+
+
+def prepare_tokenizer(tokenizer_path):
+    if "SGLANG_USE_MODELSCOPE" in os.environ:
+        if not os.path.exists(tokenizer_path):
+            from modelscope import snapshot_download
+
+            return snapshot_download(
+                tokenizer_path, ignore_patterns=["*.bin", "*.safetensors"]
+            )
+    return tokenizer_path

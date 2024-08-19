@@ -34,7 +34,6 @@ from typing import Dict, List, Optional, Union
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
 import aiohttp
-import psutil
 import requests
 import uvicorn
 import uvloop
@@ -60,6 +59,7 @@ from sglang.srt.openai_api.adapter import (
     v1_chat_completions,
     v1_completions,
     v1_delete_file,
+    v1_embeddings,
     v1_files_create,
     v1_retrieve_batch,
     v1_retrieve_file,
@@ -74,6 +74,8 @@ from sglang.srt.utils import (
     enable_show_time_cost,
     kill_child_process,
     maybe_set_triton_cache_manager,
+    prepare_model,
+    prepare_tokenizer,
     set_ulimit,
 )
 from sglang.utils import get_exception_traceback
@@ -174,6 +176,12 @@ async def openai_v1_chat_completions(raw_request: Request):
     return await v1_chat_completions(tokenizer_manager, raw_request)
 
 
+@app.post("/v1/embeddings")
+async def openai_v1_embeddings(raw_request: Request):
+    response = await v1_embeddings(tokenizer_manager, raw_request)
+    return response
+
+
 @app.get("/v1/models")
 def available_models():
     """Show available models."""
@@ -250,6 +258,10 @@ def launch_server(
     )
     logger.info(f"{server_args=}")
 
+    # Use model from www.modelscope.cn, first download the model.
+    server_args.model_path = prepare_model(server_args.model_path)
+    server_args.tokenizer_path = prepare_tokenizer(server_args.tokenizer_path)
+
     # Launch processes for multi-node tensor parallelism
     if server_args.nnodes > 1:
         if server_args.node_rank != 0:
@@ -275,6 +287,8 @@ def launch_server(
 
     # Launch processes
     tokenizer_manager = TokenizerManager(server_args, port_args, model_overide_args)
+    if server_args.chat_template:
+        load_chat_template_for_openai_api(tokenizer_manager, server_args.chat_template)
     pipe_controller_reader, pipe_controller_writer = mp.Pipe(duplex=False)
     pipe_detoken_reader, pipe_detoken_writer = mp.Pipe(duplex=False)
 
@@ -345,6 +359,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     os.environ["NCCL_CUMEM_ENABLE"] = "0"
     os.environ["NCCL_NVLS_ENABLE"] = "0"
     os.environ["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"
+    os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
 
     # Set ulimit
     set_ulimit()
@@ -362,16 +377,11 @@ def _set_envs_and_config(server_args: ServerArgs):
         # FIXME: remove this after https://github.com/triton-lang/triton/pull/4295 is used as a dependency.
         maybe_set_triton_cache_manager()
 
-    # Set global chat template
-    if server_args.chat_template:
-        # TODO: replace this with huggingface transformers template
-        load_chat_template_for_openai_api(server_args.chat_template)
-
     # Check flashinfer version
     if not server_args.disable_flashinfer:
         assert_pkg_version(
             "flashinfer",
-            "0.1.3",
+            "0.1.5",
             "Please uninstall the old version and "
             "reinstall the latest version by following the instructions "
             "at https://docs.flashinfer.ai/installation.html.",
@@ -406,18 +416,23 @@ def _wait_and_warmup(server_args, pipe_finish_writer):
 
     # Send a warmup request
     request_name = "/generate" if model_info["is_generation"] else "/encode"
-    max_new_tokens = 8 if model_info["is_generation"] else 0
+    max_new_tokens = 8 if model_info["is_generation"] else 1
+    json_data = {
+        "sampling_params": {
+            "temperature": 0,
+            "max_new_tokens": max_new_tokens,
+        },
+    }
+    if server_args.skip_tokenizer_init:
+        json_data["input_ids"] = [10, 11, 12]
+    else:
+        json_data["text"] = "The capital city of France is"
+
     try:
         for _ in range(server_args.dp_size):
             res = requests.post(
                 url + request_name,
-                json={
-                    "text": "The capital city of France is",
-                    "sampling_params": {
-                        "temperature": 0,
-                        "max_new_tokens": max_new_tokens,
-                    },
-                },
+                json=json_data,
                 headers=headers,
                 timeout=600,
             )
@@ -506,11 +521,18 @@ class Runtime:
         prompt: str,
         sampling_params: Optional[Dict] = None,
     ):
-        json_data = {
-            "text": prompt,
-            "sampling_params": sampling_params,
-            "stream": True,
-        }
+        if self.server_args.skip_tokenizer_init:
+            json_data = {
+                "input_ids": prompt,
+                "sampling_params": sampling_params,
+                "stream": True,
+            }
+        else:
+            json_data = {
+                "text": prompt,
+                "sampling_params": sampling_params,
+                "stream": True,
+            }
         pos = 0
 
         timeout = aiohttp.ClientTimeout(total=3 * 3600)
@@ -522,10 +544,13 @@ class Runtime:
                         if chunk == "data: [DONE]\n\n":
                             break
                         data = json.loads(chunk[5:].strip("\n"))
-                        cur = data["text"][pos:]
-                        if cur:
-                            yield cur
-                        pos += len(cur)
+                        if hasattr(data, "text"):
+                            cur = data["text"][pos:]
+                            if cur:
+                                yield cur
+                            pos += len(cur)
+                        else:
+                            yield data
 
     add_request = async_generate
 
@@ -534,12 +559,14 @@ class Runtime:
         prompt: str,
         sampling_params: Optional[Dict] = None,
         return_logprob: Optional[Union[List[bool], bool]] = False,
+        logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
     ):
         json_data = {
             "text": prompt,
             "sampling_params": sampling_params,
             "return_logprob": return_logprob,
+            "logprob_start_len": logprob_start_len,
             "top_logprobs_num": top_logprobs_num,
         }
         response = requests.post(
