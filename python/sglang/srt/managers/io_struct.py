@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Union
 
 from sglang.srt.managers.schedule_batch import BaseFinishReason
-from sglang.srt.sampling_params import SamplingParams
+from sglang.srt.sampling.sampling_params import SamplingParams
 
 
 @dataclass
@@ -276,6 +276,20 @@ class BatchEmbeddingOut:
 @dataclass
 class FlushCacheReq:
     pass
+
+
+@dataclass
+class UpdateWeightReqInput:
+    # The model path with the new weights
+    model_path: str
+    # The format to load the weights
+    load_format: Optional[str] = None
+
+
+@dataclass
+class UpdateWeightReqOutput:
+    success: bool
+    message: str
 
 
 @dataclass

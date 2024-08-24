@@ -80,6 +80,7 @@ class ServerArgs:
     disable_radix_cache: bool = False
     disable_regex_jump_forward: bool = False
     disable_cuda_graph: bool = False
+    disable_cuda_graph_padding: bool = False
     disable_disk_cache: bool = False
     enable_mixed_chunk: bool = False
     enable_torch_compile: bool = False
@@ -87,6 +88,7 @@ class ServerArgs:
     enable_mla: bool = False
     attention_reduce_in_fp32: bool = False
     efficient_weight_load: bool = False
+    disable_custom_all_reduce: bool = False
 
     # Distributed args
     nccl_init_addr: Optional[str] = None
@@ -394,6 +396,11 @@ class ServerArgs:
             help="Disable cuda graph.",
         )
         parser.add_argument(
+            "--disable-cuda-graph-padding",
+            action="store_true",
+            help="Disable cuda graph when padding is needed. Still uses cuda graph when padding is not needed.",
+        )
+        parser.add_argument(
             "--disable-disk-cache",
             action="store_true",
             help="Disable disk cache to avoid possible crashes related to file system or high concurrency.",
@@ -416,18 +423,24 @@ class ServerArgs:
         parser.add_argument(
             "--enable-mla",
             action="store_true",
-            help="Enable Multi-head Latent Attention (MLA) for DeepSeek-V2",
+            help="Enable Multi-head Latent Attention (MLA) for DeepSeek-V2.",
         )
         parser.add_argument(
             "--attention-reduce-in-fp32",
             action="store_true",
             help="Cast the intermidiate attention results to fp32 to avoid possible crashes related to fp16."
-            "This only affects Triton attention kernels",
+            "This only affects Triton attention kernels.",
         )
         parser.add_argument(
             "--efficient-weight-load",
             action="store_true",
             help="Turn on memory efficient weight loading with quantization (quantize per layer during loading).",
+        )
+        parser.add_argument(
+            "--disable-custom-all-reduce",
+            action="store_true",
+            default=False,
+            help="Disable the custom all-reduce kernel and fall back to NCCL.",
         )
 
     @classmethod
@@ -440,15 +453,6 @@ class ServerArgs:
     def url(self):
         return f"http://{self.host}:{self.port}"
 
-    def print_mode_args(self):
-        return (
-            f"disable_flashinfer={self.disable_flashinfer}, "
-            f"attention_reduce_in_fp32={self.attention_reduce_in_fp32}, "
-            f"disable_radix_cache={self.disable_radix_cache}, "
-            f"disable_regex_jump_forward={self.disable_regex_jump_forward}, "
-            f"disable_disk_cache={self.disable_disk_cache}, "
-        )
-
     def check_server_args(self):
         assert (
             self.tp_size % self.nnodes == 0
@@ -457,7 +461,7 @@ class ServerArgs:
             self.dp_size > 1 and self.node_rank is not None
         ), "multi-node data parallel is not supported"
         if "gemma-2" in self.model_path.lower():
-            logger.info(f"When using sliding window in gemma-2, turn on flashinfer.")
+            logger.info("When using sliding window in gemma-2, turn on flashinfer.")
             self.disable_flashinfer = False
 
 

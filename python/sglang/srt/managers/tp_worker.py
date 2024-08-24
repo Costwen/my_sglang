@@ -39,6 +39,8 @@ from sglang.srt.managers.io_struct import (
     FlushCacheReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+    UpdateWeightReqInput,
+    UpdateWeightReqOutput,
 )
 from sglang.srt.managers.policy_scheduler import PolicyScheduler, PrefillAdder
 from sglang.srt.managers.schedule_batch import (
@@ -131,6 +133,13 @@ class ModelTpServer:
             self.model_config.context_len - 1,
             self.max_total_num_tokens - 1,
         )
+
+        # Sync random seed
+        server_args.random_seed = broadcast_recv_input(
+            [server_args.random_seed],
+            self.tp_rank,
+            self.model_runner.tp_group.cpu_group,
+        )[0]
         set_random_seed(server_args.random_seed)
 
         # Print info
@@ -214,6 +223,9 @@ class ModelTpServer:
                     self.flush_cache()
                 elif isinstance(recv_req, AbortReq):
                     self.abort_request(recv_req)
+                elif isinstance(recv_req, UpdateWeightReqInput):
+                    success, message = self.update_weights(recv_req)
+                    self.out_pyobjs.append(UpdateWeightReqOutput(success, message))
                 else:
                     raise ValueError(f"Invalid request: {recv_req}")
 
@@ -310,11 +322,16 @@ class ModelTpServer:
         if self.model_runner.is_generation:
             req.pixel_values = recv_req.pixel_values
             if req.pixel_values is not None:
+                image_hash = (
+                    hash(tuple(recv_req.image_hash))
+                    if isinstance(recv_req.image_hash, list)
+                    else recv_req.image_hash
+                )
                 req.pad_value = [
-                    (recv_req.image_hash) % self.model_config.vocab_size,
-                    (recv_req.image_hash >> 16) % self.model_config.vocab_size,
-                    (recv_req.image_hash >> 32) % self.model_config.vocab_size,
-                    (recv_req.image_hash >> 64) % self.model_config.vocab_size,
+                    (image_hash) % self.model_config.vocab_size,
+                    (image_hash >> 16) % self.model_config.vocab_size,
+                    (image_hash >> 32) % self.model_config.vocab_size,
+                    (image_hash >> 64) % self.model_config.vocab_size,
                 ]
                 req.image_size = recv_req.image_size
                 (
@@ -469,8 +486,9 @@ class ModelTpServer:
             # Forward and sample the next tokens
             if batch.extend_num_tokens != 0:
                 output = self.model_runner.forward(batch, ForwardMode.EXTEND)
-                next_token_ids = batch.sample(
-                    output.next_token_logits, self.model_runner.is_multi_node_tp
+                next_token_ids = batch.sample(output.next_token_logits)
+                batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
+                    next_token_ids
                 )
 
                 # Move logprobs to cpu
@@ -503,6 +521,11 @@ class ModelTpServer:
                     req.completion_tokens_wo_jump_forward += 1
                     req.output_ids.append(next_token_ids[i])
                     req.check_finished()
+
+                if req.regex_fsm is not None:
+                    req.regex_fsm_state = req.regex_fsm.get_next_state(
+                        req.regex_fsm_state, next_token_ids[i]
+                    )
 
                 if req.finished():
                     self.tree_cache.cache_finished_req(req)
@@ -631,8 +654,9 @@ class ModelTpServer:
 
         # Forward and sample the next tokens
         output = self.model_runner.forward(batch, ForwardMode.DECODE)
-        next_token_ids = batch.sample(
-            output.next_token_logits, self.model_runner.is_multi_node_tp
+        next_token_ids = batch.sample(output.next_token_logits)
+        batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
+            next_token_ids
         )
 
         # Move logprobs to cpu
@@ -649,6 +673,11 @@ class ModelTpServer:
             req.completion_tokens_wo_jump_forward += 1
             req.output_ids.append(next_token_id)
             req.check_finished()
+
+            if req.regex_fsm is not None:
+                req.regex_fsm_state = req.regex_fsm.get_next_state(
+                    req.regex_fsm_state, next_token_id
+                )
 
             if req.finished():
                 self.tree_cache.cache_finished_req(req)
@@ -773,12 +802,15 @@ class ModelTpServer:
             self.token_to_kv_pool.clear()
             torch.cuda.empty_cache()
             logger.info("Cache flushed successfully!")
+            if_success = True
         else:
-            warnings.warn(
+            logging.warning(
                 f"Cache not flushed because there are pending requests. "
                 f"#queue-req: {len(self.waiting_queue)}, "
                 f"#running-req: {0 if self.running_batch is None else len(self.running_batch.reqs)}"
             )
+            if_success = False
+        return if_success
 
     def abort_request(self, recv_req):
         # Delete requests in the waiting queue
@@ -797,6 +829,15 @@ class ModelTpServer:
                 if req.rid == recv_req.rid:
                     req.finished_reason = FINISH_ABORT()
                     break
+
+    def update_weights(self, recv_req):
+        success, message = self.model_runner.update_weights(
+            recv_req.model_path, recv_req.load_format
+        )
+        if success:
+            flash_cache_success = self.flush_cache()
+            assert flash_cache_success, "Cache flush failed after updating weights"
+        return success, message
 
 
 def run_tp_server(
@@ -862,6 +903,7 @@ def broadcast_recv_input(
 
             dist.broadcast(tensor_size, src=0, group=dist_group)
             dist.broadcast(tensor_data, src=0, group=dist_group)
+        return data
     else:
         tensor_size = torch.tensor([0], dtype=torch.long)
         dist.broadcast(tensor_size, src=0, group=dist_group)
